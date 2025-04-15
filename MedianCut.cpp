@@ -1,143 +1,136 @@
 #include <vector>
-#include <algorithm>
 #include <cstdint>
-#include <iostream>
-#include <functional>
+#include <algorithm>
+#include <cmath>
+#include <limits>
 
-struct Color {
-    uint8_t r, g, b;
-
-    Color(uint8_t red = 0, uint8_t green = 0, uint8_t blue = 0)
-        : r(red), g(green), b(blue) {
-    }
-
-    // 輝度（明るさ）を計算（ソート用）
-    int brightness() const {
-        return r + g + b;
-    }
+struct Color32 {
+    uint8_t r, g, b, a; // 赤・緑・青・アルファ値（透過）
 };
 
-// メディアンカット減色アルゴリズム
-std::vector<Color> medianCut(std::vector<Color>& colorData, int maxColorGroupCount = 64) {
-    using PixelIndex = size_t;
+// 各色ボックスを保持する構造体
+struct ColorBox {
+    std::vector<Color32> colors; // このボックス内の色
+    int rMin, rMax, gMin, gMax, bMin, bMax; // RGBの最小・最大値（ボックスのサイズを決める）
+};
 
-    // インデックス配列の初期化（全ピクセルが対象）
-    std::vector<PixelIndex> allIndices(colorData.size());
-    for (PixelIndex i = 0; i < colorData.size(); ++i) {
-        allIndices[i] = i;
+// 2色間のユークリッド距離の2乗を計算（比較用）
+int colorDistanceSquared(const Color32& c1, const Color32& c2) {
+    int dr = int(c1.r) - int(c2.r);
+    int dg = int(c1.g) - int(c2.g);
+    int db = int(c1.b) - int(c2.b);
+    return dr * dr + dg * dg + db * db;
+}
+
+// 与えられた色の集合の平均色を求める（各成分の合計÷総数）
+Color32 averageColor(const std::vector<Color32>& colors) {
+    uint64_t r = 0, g = 0, b = 0, a = 0;
+    for (const auto& c : colors) {
+        r += c.r;
+        g += c.g;
+        b += c.b;
+        a += c.a;
     }
+    size_t count = colors.size();
+    return {
+        static_cast<uint8_t>(r / count),
+        static_cast<uint8_t>(g / count),
+        static_cast<uint8_t>(b / count),
+        static_cast<uint8_t>(a / count)
+    };
+}
 
-    if (allIndices.empty()) return {};
+// ボックスのRGB範囲を更新（最大/最小の再計算）
+void updateBox(ColorBox& box) {
+    // 初期値に1つ目の色を設定
+    box.rMin = box.rMax = box.colors[0].r;
+    box.gMin = box.gMax = box.colors[0].g;
+    box.bMin = box.bMax = box.colors[0].b;
 
-    // 一時的なグループ配列（再帰的に分割）
-    std::vector<std::vector<PixelIndex>> tmpGroups{ allIndices };
-    std::vector<std::vector<PixelIndex>> finalGroups;
+    // 色ごとに最小・最大を更新
+    for (const auto& c : box.colors) {
+        box.rMin = std::min(box.rMin, (int)c.r);
+        box.rMax = std::max(box.rMax, (int)c.r);
+        box.gMin = std::min(box.gMin, (int)c.g);
+        box.gMax = std::max(box.gMax, (int)c.g);
+        box.bMin = std::min(box.bMin, (int)c.b);
+        box.bMax = std::max(box.bMax, (int)c.b);
+    }
+}
 
-    // 最大グループ数になるまで分割処理を繰り返す
-    while (tmpGroups.size() + finalGroups.size() < static_cast<size_t>(maxColorGroupCount)) {
-        // 一番要素数が多いグループを探す
-        auto maxIt = std::max_element(tmpGroups.begin(), tmpGroups.end(),
-            [](const auto& a, const auto& b) { return a.size() < b.size(); });
+// メディアンカット減色アルゴリズム本体
+void medianCut(std::vector<Color32>& pix, int w, int h, uint8_t maxColor) {
+    std::vector<ColorBox> boxes;
 
-        if (maxIt == tmpGroups.end() || maxIt->empty()) break;
+    // 初期ボックスにはすべての色を入れる
+    ColorBox initialBox{ pix };
+    updateBox(initialBox); // 初期ボックスの範囲を計算
+    boxes.push_back(initialBox);
 
-        auto group = std::move(*maxIt);
-        tmpGroups.erase(maxIt);
+    // 色数がmaxColorに達するまで分割を繰り返す
+    while (boxes.size() < maxColor) {
+        // 分割すべき最も「広い」ボックスを探す
+        auto it = std::max_element(boxes.begin(), boxes.end(), [](const ColorBox& a, const ColorBox& b) {
+            int rangeA = std::max({ a.rMax - a.rMin, a.gMax - a.gMin, a.bMax - a.bMin });
+            int rangeB = std::max({ b.rMax - b.rMin, b.gMax - b.gMin, b.bMax - b.bMin });
+            return rangeA < rangeB; // 範囲が広いほうを優先
+            });
 
-        // RGB成分の最小・最大を求める
-        uint8_t rMin = 255, rMax = 0;
-        uint8_t gMin = 255, gMax = 0;
-        uint8_t bMin = 255, bMax = 0;
+        // 分割不能なら終了（色が1つしかない等）
+        if (it == boxes.end() || it->colors.size() <= 1)
+            break;
 
-        for (PixelIndex idx : group) {
-            const Color& c = colorData[idx];
-            rMin = std::min(rMin, c.r); rMax = std::max(rMax, c.r);
-            gMin = std::min(gMin, c.g); gMax = std::max(gMax, c.g);
-            bMin = std::min(bMin, c.b); bMax = std::max(bMax, c.b);
-        }
+        ColorBox box = *it;         // 分割対象のボックスを取り出す
+        boxes.erase(it);            // 元のリストから削除
 
-        // RGBそれぞれの範囲
-        int rRange = rMax - rMin;
-        int gRange = gMax - gMin;
-        int bRange = bMax - bMin;
-
-        // 単一色しかない場合はこれ以上分割不要
-        if (rRange == 0 && gRange == 0 && bRange == 0) {
-            finalGroups.push_back(std::move(group));
-            continue;
-        }
-
-        // 分割軸と中心値を決定（最大範囲を持つ成分）
-        std::function<uint8_t(const Color&)> getComponent;
-        float center = 0.0f;
+        // RGB成分のどれを軸に分割するか決める（最大範囲の成分）
+        int rRange = box.rMax - box.rMin;
+        int gRange = box.gMax - box.gMin;
+        int bRange = box.bMax - box.bMin;
 
         if (rRange >= gRange && rRange >= bRange) {
-            getComponent = [](const Color& c) { return c.r; };
-            center = (rMin + rMax) / 2.0f;
+            std::sort(box.colors.begin(), box.colors.end(),
+                [](const Color32& a, const Color32& b) { return a.r < b.r; });
         }
         else if (gRange >= rRange && gRange >= bRange) {
-            getComponent = [](const Color& c) { return c.g; };
-            center = (gMin + gMax) / 2.0f;
+            std::sort(box.colors.begin(), box.colors.end(),
+                [](const Color32& a, const Color32& b) { return a.g < b.g; });
         }
         else {
-            getComponent = [](const Color& c) { return c.b; };
-            center = (bMin + bMax) / 2.0f;
+            std::sort(box.colors.begin(), box.colors.end(),
+                [](const Color32& a, const Color32& b) { return a.b < b.b; });
         }
 
-        // グループを中心値で分割
-        std::vector<PixelIndex> lowerGroup, upperGroup;
-        lowerGroup.reserve(group.size() / 2);
-        upperGroup.reserve(group.size() / 2);
+        // ソートした色を2分割（中央値で分ける）
+        size_t mid = box.colors.size() / 2;
+        ColorBox box1{ std::vector<Color32>(box.colors.begin(), box.colors.begin() + mid) };
+        ColorBox box2{ std::vector<Color32>(box.colors.begin() + mid, box.colors.end()) };
 
-        for (PixelIndex idx : group) {
-            if (getComponent(colorData[idx]) < center) {
-                lowerGroup.push_back(idx);
-            }
-            else {
-                upperGroup.push_back(idx);
-            }
-        }
+        updateBox(box1); // 分割後のボックスの範囲を更新
+        updateBox(box2);
 
-        // 空でないグループだけ追加（空を避けることで分割効率アップ）
-        if (!lowerGroup.empty()) tmpGroups.push_back(std::move(lowerGroup));
-        if (!upperGroup.empty()) tmpGroups.push_back(std::move(upperGroup));
+        // 新しい2つのボックスを追加
+        boxes.push_back(box1);
+        boxes.push_back(box2);
     }
 
-    // 最終グループに残ったものを合流
-    finalGroups.insert(finalGroups.end(), tmpGroups.begin(), tmpGroups.end());
-
-    // 平均色計算＆データ書き換え
-    std::vector<Color> palette;
-    palette.reserve(finalGroups.size());
-
-    for (const auto& group : finalGroups) {
-        uint64_t sumR = 0, sumG = 0, sumB = 0;
-
-        for (PixelIndex idx : group) {
-            const Color& c = colorData[idx];
-            sumR += c.r;
-            sumG += c.g;
-            sumB += c.b;
-        }
-
-        Color avgColor(
-            static_cast<uint8_t>(sumR / group.size()),
-            static_cast<uint8_t>(sumG / group.size()),
-            static_cast<uint8_t>(sumB / group.size())
-        );
-
-        // グループ内ピクセルをすべて平均色で置換
-        for (PixelIndex idx : group) {
-            colorData[idx] = avgColor;
-        }
-
-        palette.push_back(avgColor);
+    // ボックスごとの平均色を使ってパレット作成
+    std::vector<Color32> palette;
+    for (const auto& box : boxes) {
+        palette.push_back(averageColor(box.colors));
     }
 
-    // パレットは明るさ順にソート
-    std::sort(palette.begin(), palette.end(), [](const Color& a, const Color& b) {
-        return a.brightness() < b.brightness();
-        });
-
-    return palette;
+    // 全ピクセルをパレットの最近傍色に変換
+    for (auto& p : pix) {
+        int minDist = std::numeric_limits<int>::max();
+        Color32 nearest = palette[0];
+        for (const auto& c : palette) {
+            int dist = colorDistanceSquared(p, c); // 色距離の2乗を使って比較
+            if (dist < minDist) {
+                minDist = dist;
+                nearest = c;
+            }
+        }
+        p = nearest; // 最も近い色に置き換え
+    }
 }
